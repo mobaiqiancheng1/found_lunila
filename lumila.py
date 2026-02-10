@@ -8,6 +8,7 @@ import time  # 时间模块（此版本中未直接使用，可扩展）
 import requests  # HTTP 请求，用于获取基金实时数据
 import json  # JSON 解析
 from openai import OpenAI  # OpenAI SDK（此处用于 DeepSeek 接口）
+from st_supabase_connection import SupabaseConnection # 新增这一行
 
 # ============================
 # 1. API 密钥配置（已内置）
@@ -137,26 +138,47 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================
-# 4. 多用户数据管理
+# 4. 云端数据管理 (Supabase)
 # ============================
-# 定义存储文件夹（如果不存在则创建）
-DATA_DIR = "user_data"
-if not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
+# 初始化 Supabase 连接
+conn = st.connection("supabase", type=SupabaseConnection)
 
-def get_user_file(username):
-    """根据用户名生成对应的 CSV 路径"""
-    return os.path.join(DATA_DIR, f"portfolio_{username}.csv")
 
-def init_user_db(username):
-    """为新用户初始化数据库"""
-    file_path = get_user_file(username)
-    if not os.path.exists(file_path):
-        pd.DataFrame(
-            columns=["基金代码", "基金名称", "持有份额", "成本单价"]
-        ).to_csv(file_path, index=False, encoding="utf-8-sig")
-    return file_path
+def get_user_data(username):
+    """从云端数据库获取用户持仓"""
+    try:
+        # ttl="0" 确保每次都拿最新数据，不读缓存
+        response = conn.query("*", table="portfolios", ttl="0").eq("username", username).execute()
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        st.error(f"数据库读取失败: {e}")
+        return pd.DataFrame(columns=["username", "fund_code", "fund_name", "shares", "cost"])
 
+
+def update_fund_record(username, code, name, shares, cost):
+    """更新或插入云端记录"""
+    # 检查数据库是否已有该基金
+    existing = conn.table("portfolios").select("*").eq("username", username).eq("fund_code", code).execute()
+
+    data = {
+        "username": username,
+        "fund_code": code,
+        "fund_name": name,
+        "shares": float(shares),
+        "cost": float(cost)
+    }
+
+    if len(existing.data) > 0:
+        # 如果存在，则更新
+        conn.table("portfolios").update(data).eq("username", username).eq("fund_code", code).execute()
+    else:
+        # 如果不存在，则插入
+        conn.table("portfolios").insert(data).execute()
+
+
+def delete_fund_record(username, code):
+    """从云端删除记录"""
+    conn.table("portfolios").delete().eq("username", username).eq("fund_code", code).execute()
 
 # ============================
 # 5. 基金行情抓取函数
@@ -211,9 +233,6 @@ with st.sidebar:
         history_profit_patch = st.number_input("🛠️ 历史盈亏修正总额", value=0.0)
     current_user = st.selectbox("选择当前查看的账户", user_list)
 
-    # 获取并初始化当前账号的文件路径
-    PORTFOLIO_FILE = init_user_db(current_user)
-
     st.info(f"当前正在查看: **{current_user}** 的持仓")
     st.markdown("---")
 
@@ -262,7 +281,7 @@ with st.sidebar:
                     [[in_code.zfill(6), f_name, f_share, f_cost]],
                     columns=["基金代码", "基金名称", "持有份额", "成本单价"]
                 )
-                new_row.to_csv(PORTFOLIO_FILE, mode='a', index=False, header=False, encoding="utf-8-sig")
+                update_fund_record(current_user, in_code.zfill(6), f_name, f_share, f_cost)
                 st.success(f"已存入: {f_name}")
 
                 # 可选：清空输入框以便下一次输入
@@ -339,7 +358,7 @@ with st.sidebar:
             # 4. 提交按钮
             if st.button("🚀 确认提交交易", use_container_width=True):
                 if t_amount > 0 and t_price > 0:
-                    df = pd.read_csv(PORTFOLIO_FILE, dtype={'基金代码': str})
+                    df = get_user_data(current_user)
                     rows = df[df['基金代码'] == trade_code]
                     if rows.empty:
                         st.error("未找到该基金记录")
@@ -361,7 +380,7 @@ with st.sidebar:
                         df.at[idx, '成本单价'] = new_avg_cost
 
                         # ✅【补上的关键三行】
-                        df.to_csv(PORTFOLIO_FILE, index=False, encoding="utf-8-sig")
+                        update_fund_record(current_user, trade_code, row['fund_name'], new_total_share, new_avg_cost)
                         st.success(f"加仓成功！份额 +{new_share_part:.2f}")
                         time.sleep(1)
                         st.rerun()
@@ -410,7 +429,7 @@ with st.sidebar:
 # ============================
 # 7. 核心收益计算逻辑（修正占比版）
 # ============================
-df_db = pd.read_csv(PORTFOLIO_FILE, dtype={'基金代码': str})
+df_db = get_user_data(current_user)
 view_data = []
 total_v = 0;
 total_d = 0;
@@ -565,7 +584,8 @@ with col_main:
         if btn_del:
             to_del = edited_df[edited_df["选"] == True]["代码"].tolist()
             if to_del:
-                df_db[~df_db["基金代码"].isin(to_del)].to_csv(PORTFOLIO_FILE, index=False, encoding="utf-8-sig")
+                for code in to_del:
+                    delete_fund_record(current_user, code)
                 st.rerun()
     else:
         st.info("暂无数据。")
